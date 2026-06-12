@@ -61,8 +61,10 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         prefix: str = "model.layers.0.self_attn.attn",
+        manual_fusion: bool = False,
     ):
         super().__init__()
+        self.manual_fusion = manual_fusion
         self.num_heads = num_heads
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
@@ -208,6 +210,27 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
+
+        if self.manual_fusion:
+            # Mirrors the manual fusion seam in
+            # MultiHeadLatentAttentionWrapper.forward (RFC #43224): the fused
+            # op is emitted directly from model code on the strided q_pe
+            # slice and the 2-D split-view k_pe.
+            kv_c = kv_c.contiguous()
+            dummy = torch.ops.vllm.fused_rope_unified_mla_kv_cache_update(
+                positions,
+                q[..., self.qk_nope_head_dim :],
+                k_pe,
+                kv_c,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.is_neox_style,
+                self.kv_cache_dtype_str,
+                self.mla_attn._k_scale,
+                _encode_layer_name(self.layer_name),
+            )
+            k_pe = k_pe.unsqueeze(1)
+            return q, kv_c, k_pe, dummy
+
         k_pe = k_pe.unsqueeze(1)
 
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
@@ -408,6 +431,150 @@ def test_mla_rope_kvcache_cat_fusion(
         torch.testing.assert_close(
             kv_cache_unfused.view(dtype),
             kv_cache_fused.view(dtype),
+            atol=ATOL,
+            rtol=RTOL,
+        )
+
+
+@pytest.mark.parametrize("attn_backend", [AttentionBackendEnum.TRITON_MLA])
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="MLA RoPE+KVCache+Cat fusion is only supported on CUDA and ROCm.",
+)
+def test_mla_rope_kvcache_manual_fusion_compile(
+    attn_backend: AttentionBackendEnum,
+    is_neox: bool,
+    dtype: torch.dtype,
+    kv_cache_dtype: str,
+):
+    """The manual fusion seam (the model emits
+    ``fused_rope_unified_mla_kv_cache_update`` directly, RFC #43224) must
+    survive torch.compile: FixFunctionalizationPass has to de-functionalize
+    the op when the surrounding graph has no fusion-pass-produced copy/view
+    chain, only the slice_scatter nodes auto-functionalization creates for
+    the strided q_pe slice and split-view k_pe."""
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(0)
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="deepseek-ai/DeepSeek-V2-Lite",
+            dtype=dtype,
+        ),
+        cache_config=CacheConfig(
+            block_size=16,
+            cache_dtype=kv_cache_dtype,
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            pass_config=PassConfig(
+                fuse_rope_kvcache_cat_mla=True,
+                eliminate_noops=True,
+            ),
+        ),
+    )
+
+    with vllm.config.set_current_vllm_config(vllm_config):
+        if not torch.distributed.is_initialized():
+            from vllm.distributed.parallel_state import (
+                init_distributed_environment,
+                initialize_model_parallel,
+            )
+            from vllm.utils.system_utils import update_environment_variables
+
+            update_environment_variables(
+                {
+                    "RANK": "0",
+                    "LOCAL_RANK": "0",
+                    "WORLD_SIZE": "1",
+                    "MASTER_ADDR": "localhost",
+                    "MASTER_PORT": "54321",
+                }
+            )
+            init_distributed_environment()
+            initialize_model_parallel()
+
+        model = MLARoPEKVCacheCatTestModel(
+            vllm_config=vllm_config,
+            attn_backend=attn_backend,
+            use_deepseek_scaling_rope=True,
+            num_heads=16,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            q_lora_rank=1536,
+            kv_lora_rank=512,
+            is_neox=is_neox,
+            dtype=dtype,
+            device=torch.get_default_device(),
+            manual_fusion=True,
+        )
+
+        # No fusion pass: the op is already in the traced graph. Only the
+        # functionalization cleanup the production pipeline would run.
+        passes = [
+            NoOpEliminationPass(vllm_config),
+            PostCleanupPass(vllm_config),
+            FixFunctionalizationPass(vllm_config),
+        ]
+        backend = TestBackend(*passes)
+
+        T = 5
+
+        qkv_lora = torch.randn(T, 1536 + 512 + 64, dtype=dtype)
+        pos = torch.arange(T, dtype=torch.long)
+
+        qkv_eager = qkv_lora.clone()
+        pos_eager = pos.clone()
+
+        # Eager reference
+        with set_forward_context(None, vllm_config):
+            forward_context = get_forward_context()
+            attn_metadata = model.build_attn_metadata(T)
+            forward_context.slot_mapping = {
+                model.layer_name: attn_metadata.slot_mapping
+            }
+            q_eager, kv_c_eager, k_pe_eager, dummy = model(qkv_eager, pos_eager)
+            attn_layer = forward_context.no_compile_layers[model.layer_name]
+            kv_cache_eager = attn_layer.kv_cache.clone()
+        del dummy
+
+        # Compiled
+        torch._dynamo.mark_dynamic(qkv_lora, 0)
+        torch._dynamo.mark_dynamic(pos, 0)
+        with set_forward_context(None, vllm_config):
+            model_compiled = torch.compile(model, backend=backend)
+            forward_context = get_forward_context()
+            attn_metadata = model.build_attn_metadata(T)
+            forward_context.slot_mapping = {
+                model.layer_name: attn_metadata.slot_mapping
+            }
+            q_comp, kv_c_comp, k_pe_comp, dummy = model_compiled(qkv_lora, pos)
+            attn_layer = forward_context.no_compile_layers[model.layer_name]
+            kv_cache_comp = attn_layer.kv_cache
+        del dummy
+
+        # De-functionalization must have lowered the op to its in-place form.
+        # (check_after_ops is unusable here: the op is already in the
+        # pre-pass graph because the model emits it directly.)
+        from vllm.compilation.passes.fx_utils import find_op_nodes
+
+        fused_op = torch.ops.vllm.fused_rope_unified_mla_kv_cache_update
+        assert len(list(find_op_nodes(fused_op, backend.graph_post_pass))) == 1
+        for node in backend.graph_post_pass.nodes:
+            assert node.target != torch.ops.higher_order.auto_functionalized
+
+        ATOL, RTOL = (1e-2, 1e-2)
+        torch.testing.assert_close(q_eager, q_comp, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(kv_c_eager, kv_c_comp, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(k_pe_eager, k_pe_comp, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(
+            kv_cache_eager.view(dtype),
+            kv_cache_comp.view(dtype),
             atol=ATOL,
             rtol=RTOL,
         )
